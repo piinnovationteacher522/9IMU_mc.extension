@@ -1,0 +1,16 @@
+{
+    "compilerOptions": {
+        "target": "ES5",
+        "lib": ["ES5"],
+        "strict": true,
+        "noImplicitAny": true,
+        "noEmit": true,
+        "types": [],
+        "skipLibCheck": true
+    },
+    "files": [
+        "sen0694.ts",
+        "test.ts",
+        "test/pxt-stubs.d.ts"
+    ]
+}
