@@ -16,9 +16,12 @@ function sen0694Smoke(): void {
     const tap = SEN0694.tap()
     const dir = SEN0694.direction()
     const facing = SEN0694.face()
+    SEN0694.setHeadingZero()
+    const bearing = SEN0694.heading()
+    const turned = SEN0694.relativeHeading()
     const ok = SEN0694.isConnected()
 
-    if (ok && ax + gy + mz + steps + tap + dir + facing > -100000) {
+    if (ok && ax + gy + mz + steps + tap + dir + facing + bearing + turned > -100000) {
         basic.pause(1)
     }
     SEN0694.reset()

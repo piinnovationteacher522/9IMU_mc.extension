@@ -47,6 +47,7 @@ namespace SEN0694 {
     let raw6At = -100000
     let rawMag: number[] = [0, 0, 0]
     let rawMagAt = -100000
+    let headingReference = 0
 
     export enum Quantity {
         //% block="加速度 (g)"
@@ -230,6 +231,49 @@ namespace SEN0694 {
     function encodeWrite(reg: number, value: number): number[] {
         return [reg & 0xff, (reg >> 8) & 0xff, value & 0xff, (value >> 8) & 0xff]
     }
+
+    /**
+     * Magnetic heading of the board +X axis, degrees clockwise from magnetic
+     * north when viewed from above. Returns -1 when +X is nearly vertical or
+     * the horizontal magnetic field is too small to trust.
+     * The accelerometer vector is treated as "up", so the SEN0694 face-up
+     * reading of about -1 g on Z does not need a separate axis flip.
+     */
+    function headingDegrees(ax: number, ay: number, az: number, mx: number, my: number, mz: number): number {
+        const an = Math.sqrt(ax * ax + ay * ay + az * az)
+        const mn = Math.sqrt(mx * mx + my * my + mz * mz)
+        if (an < 1e-6 || mn < 1e-6) return -1
+        const ux = ax / an
+        const uy = ay / an
+        const uz = az / an
+        const align = mx * ux + my * uy + mz * uz
+        const nx = mx - ux * align
+        const ny = my - uy * align
+        const nz = mz - uz * align
+        const nn = Math.sqrt(nx * nx + ny * ny + nz * nz)
+        const fx = 1 - ux * ux
+        const fy = -uy * ux
+        const fz = -uz * ux
+        const fn = Math.sqrt(fx * fx + fy * fy + fz * fz)
+        if (nn < mn * 0.05 || fn < 0.2) return -1
+        const cx = ny * fz - nz * fy
+        const cy = nz * fx - nx * fz
+        const cz = nx * fy - ny * fx
+        const sinTerm = -(ux * cx + uy * cy + uz * cz)
+        const cosTerm = nx * fx + ny * fy + nz * fz
+        let deg = Math.atan2(sinTerm, cosTerm) * (180 / Math.PI)
+        if (deg < 0) deg += 360
+        return deg
+    }
+
+    /** Signed shortest turn from reference to current: right is positive, left is negative. */
+    function relativeDegrees(current: number, reference: number): number {
+        if (current < 0 || reference < 0) return -1
+        let delta = current - reference
+        while (delta > 180) delta -= 360
+        while (delta < -180) delta += 360
+        return delta
+    }
     // SCALE_END
 
     function axisIndex(axis: Axis): number {
@@ -363,6 +407,58 @@ namespace SEN0694 {
             return lsbToDps(raw6[3 + index], gyroRangeDps)
         }
         return lsbToG(raw6[index], accelRangeG)
+    }
+
+    /**
+     * 模組 +X 軸目前的磁方位角，0 到 360 度。
+     * 0 表示 +X 指向磁北，90 表示指向磁東，順時針增加。
+     * 從正上方往下看。平放或傾斜都可以；+X 幾乎朝天或朝地時回傳 -1。
+     * 這是磁北，不是地圖上的真北。附近的鐵或磁鐵會使角度偏移。
+     */
+    //% blockId=sen0694_heading
+    //% block="面向角度"
+    //% group="讀取"
+    //% weight=96
+    export function heading(): number {
+        refresh6()
+        refreshMag()
+        if (!connected) return -1
+        return headingDegrees(
+            lsbToG(raw6[0], accelRangeG),
+            lsbToG(raw6[1], accelRangeG),
+            lsbToG(raw6[2], accelRangeG),
+            magToUt(rawMag[0]),
+            magToUt(rawMag[1]),
+            magToUt(rawMag[2])
+        )
+    }
+
+    /**
+     * 把此刻的面向角度記成 0 度。
+     * 之後相對角度以這個方向為準：向右為正，向左為負。
+     * 讀不到面向角度時，原本的 0 度方向保持不變。
+     */
+    //% blockId=sen0694_set_heading_zero
+    //% block="將目前方向設為 0 度"
+    //% group="設定"
+    //% weight=85
+    export function setHeadingZero(): void {
+        const now = heading()
+        if (now < 0) return
+        headingReference = now
+    }
+
+    /**
+     * 相對上次歸零方向的角度。
+     * 向右 0 到 180 度，向左 0 到 -180 度。正後方為 180 或 -180。
+     * 尚未歸零時，0 度是磁北。讀不到方向時回傳 -1。
+     */
+    //% blockId=sen0694_relative_heading
+    //% block="相對角度"
+    //% group="讀取"
+    //% weight=95
+    export function relativeHeading(): number {
+        return relativeDegrees(heading(), headingReference)
     }
 
     /**

@@ -1,6 +1,9 @@
 {
     "SEN0694|block": "SEN0694 9轴",
     "SEN0694.read|block": "读取 %quantity 的 %axis",
+    "SEN0694.heading|block": "面向角度",
+    "SEN0694.setHeadingZero|block": "将当前方向设为 0 度",
+    "SEN0694.relativeHeading|block": "相对角度",
     "SEN0694.Quantity.Acceleration|block": "加速度 (g)",
     "SEN0694.Quantity.AngularVelocity|block": "角速度 (°/s)",
     "SEN0694.Quantity.MagneticField|block": "磁场 (µT)",

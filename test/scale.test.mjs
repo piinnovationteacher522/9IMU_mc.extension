@@ -12,7 +12,7 @@ function loadScale() {
     let slice = src.slice(start, end)
     slice = slice.replace(/:\s*number\[\]/g, "").replace(/:\s*number/g, "")
     return new Function(
-        `${slice}\nreturn { lsbToG, lsbToDps, magToUt, decodeU16, decodeI16, decodeI32, decodeU32, encodeWrite, rangeToG, rangeToDps };`
+        `${slice}\nreturn { lsbToG, lsbToDps, magToUt, decodeU16, decodeI16, decodeI32, decodeU32, encodeWrite, rangeToG, rangeToDps, headingDegrees, relativeDegrees };`
     )()
 }
 
@@ -121,8 +121,49 @@ test("range writes are little-endian register plus value", () => {
     assert.deepEqual(fns.encodeWrite(0x0010, 0).slice(0, 2), [0x10, 0x00])
 })
 
+function closeAngle(actual, expected) {
+    const delta = Math.abs(((actual - expected + 540) % 360) - 180)
+    assert.ok(delta < 0.05, `${actual} != ${expected}`)
+}
+
+test("heading is the clockwise angle of +X from magnetic north", () => {
+    // Face up on this module: Z about -1 g. Level, +X north.
+    closeAngle(fns.headingDegrees(0, 0, -1, 40, 0, 15), 0)
+    closeAngle(fns.headingDegrees(0, 0, -1, 0, -40, 15), 90)
+    closeAngle(fns.headingDegrees(0, 0, -1, -40, 0, 15), 180)
+    closeAngle(fns.headingDegrees(0, 0, -1, 0, 40, 15), 270)
+    // Face down still reports the same +X heading.
+    closeAngle(fns.headingDegrees(0, 0, 1, 0, 40, -15), 90)
+    // Nose-up pitch must not change a north heading.
+    const c = Math.cos(Math.PI / 6)
+    const s = -0.5
+    closeAngle(fns.headingDegrees(0.5, 0, -c, c + s * 0.5, 0, -s + c * 0.5), 0)
+})
+
+test("relative angle is right-positive and left-negative from the set-zero heading", () => {
+    assert.equal(fns.relativeDegrees(10, 0), 10)
+    assert.equal(fns.relativeDegrees(350, 0), -10)
+    assert.equal(fns.relativeDegrees(180, 0), 180)
+    assert.equal(fns.relativeDegrees(0, 180), -180)
+    assert.equal(fns.relativeDegrees(0, 90), -90)
+    assert.equal(fns.relativeDegrees(180, 90), 90)
+    assert.equal(fns.relativeDegrees(0, 270), 90)
+    assert.equal(fns.relativeDegrees(100, 100), 0)
+    assert.equal(fns.relativeDegrees(10, 200), 170)
+    assert.equal(fns.relativeDegrees(-1, 20), -1)
+    assert.equal(fns.relativeDegrees(20, -1), -1)
+})
+
+test("heading is unavailable when +X is vertical or the field is missing", () => {
+    assert.equal(fns.headingDegrees(1, 0, 0, 0, 40, 10), -1)
+    assert.equal(fns.headingDegrees(0, 0, -1, 0, 0, 0), -1)
+})
+
 test("axis dropdown blocks are present", () => {
     assert.match(src, /block="讀取 %quantity 的 %axis"/)
+    assert.match(src, /block="面向角度"/)
+    assert.match(src, /block="相對角度"/)
+    assert.match(src, /block="將目前方向設為 0 度"/)
     for (const label of ["X 軸", "Y 軸", "Z 軸", "加速度 (g)", "角速度 (°/s)", "磁場 (µT)"]) {
         assert.ok(src.includes(`block="${label}"`), label)
     }
