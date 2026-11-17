@@ -1,6 +1,6 @@
 {
     "name": "sen0694",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "MakeCode blocks for the DFRobot Gravity 9-axis IMU SEN0694. Dropdowns select acceleration, angular velocity, or magnetic field, and the X, Y, or Z axis.",
     "license": "MIT",
     "dependencies": {
