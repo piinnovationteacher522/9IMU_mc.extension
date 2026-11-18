@@ -12,7 +12,7 @@ function loadScale() {
     let slice = src.slice(start, end)
     slice = slice.replace(/:\s*number\[\]/g, "").replace(/:\s*number/g, "")
     return new Function(
-        `${slice}\nreturn { lsbToG, lsbToDps, magToUt, decodeU16, decodeI16, decodeI32, decodeU32, encodeWrite, rangeToG, rangeToDps, headingDegrees, relativeDegrees };`
+        `${slice}\nreturn { lsbToG, lsbToDps, magToUt, decodeU16, decodeI16, decodeI32, decodeU32, encodeWrite, rangeToG, rangeToDps, headingDegrees, relativeDegrees, trackHeading, elevationDegrees, elevationRateDps, tipHeightCm, nextStrike, drumZone };`
     )()
 }
 
@@ -152,6 +152,72 @@ test("relative angle is right-positive and left-negative from the set-zero headi
     assert.equal(fns.relativeDegrees(10, 200), 170)
     assert.equal(fns.relativeDegrees(-1, 20), -1)
     assert.equal(fns.relativeDegrees(20, -1), -1)
+})
+
+test("a knock does not drag the heading, and gyro keeps a tilt that happens during it", () => {
+    let state = fns.trackHeading(0, 0, -1, 0, 0, 0, 40, 0, 15, 0.05, 0, 0, 0, 0, 1, -1)
+    closeAngle(state[0], 0)
+
+    const knocked = fns.trackHeading(0, 3, -1, 0, 0, 0, 40, 0, 15, 0.05, state[1], state[2], state[3], state[4], 1, state[0])
+    closeAngle(knocked[0], 0)
+    const raw = fns.headingDegrees(0, 3, -1, 40, 0, 15)
+    assert.ok(raw < 0 || Math.abs(((raw - 0 + 540) % 360) - 180) > 15, `raw heading ${raw} should leave north`)
+
+    // 10 degrees of pitch at 100 °/s while the accelerometer is still knocked.
+    // Magnetometer is rotated with the same body rate; heading stays north.
+    const wy = 100
+    const dt = 0.1
+    const oy = wy * Math.PI / 180
+    const mx = 40
+    const mz = 15
+    const magX = mx - (oy * mz) * dt
+    const magZ = mz - (-oy * mx) * dt
+    const pitched = fns.trackHeading(0, 3, -1, 0, wy, 0, magX, 0, magZ, dt, knocked[1], knocked[2], knocked[3], knocked[4], 1, knocked[0])
+    closeAngle(pitched[0], 0)
+    assert.ok(pitched[1] > 0.1, `gravity should pitch toward +X, got ${pitched[1]}`)
+})
+
+test("stick elevation, tip height, and downward rate follow the +X axis", () => {
+    closeTo(fns.elevationDegrees(0, 0, -1), 0)
+    closeTo(fns.elevationDegrees(1, 0, 0), 90)
+    closeTo(fns.elevationDegrees(-1, 0, 0), -90)
+    closeTo(fns.elevationDegrees(0.5, 0, -Math.sqrt(0.75)), 30)
+    closeTo(fns.tipHeightCm(32, 0), 0)
+    closeTo(fns.tipHeightCm(32, 30), 16)
+    closeTo(fns.tipHeightCm(32, 90), 32)
+    closeTo(fns.elevationRateDps(0, 0, -1, 100, 0), 100)
+    closeTo(fns.elevationRateDps(0, 0, -1, -240, 0), -240)
+    closeTo(fns.elevationRateDps(0, 0, -1, 0, 300), 0)
+})
+
+test("a strike fires once, at the bottom of the downswing", () => {
+    let stroke = 0
+    let peak = 0
+    let fires = 0
+    let speed = 0
+    for (const down of [0, 100, 250, 400, 180, 50, 50]) {
+        const step = fns.nextStrike(down, 220, stroke, peak)
+        stroke = step[1]
+        peak = step[2]
+        if (step[0]) {
+            fires++
+            speed = step[3]
+        }
+    }
+    assert.equal(fires, 1)
+    assert.equal(stroke, 0)
+    assert.equal(speed, 400)
+    const again = fns.nextStrike(50, 220, stroke, peak)
+    assert.equal(again[0], 0)
+})
+
+test("drum zones are left, center, and right of the zero heading", () => {
+    assert.equal(fns.drumZone(-40), 1)
+    assert.equal(fns.drumZone(-25), 2)
+    assert.equal(fns.drumZone(0), 2)
+    assert.equal(fns.drumZone(25), 2)
+    assert.equal(fns.drumZone(40), 3)
+    assert.equal(fns.drumZone(-181), 0)
 })
 
 test("heading is unavailable when +X is vertical or the field is missing", () => {

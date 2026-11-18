@@ -17,11 +17,22 @@ function sen0694Smoke(): void {
     const dir = SEN0694.direction()
     const facing = SEN0694.face()
     SEN0694.setHeadingZero()
+    SEN0694.setStickLevel()
+    SEN0694.setStrikeThreshold(220)
     const bearing = SEN0694.heading()
     const turned = SEN0694.relativeHeading()
+    const elev = SEN0694.stickElevation()
+    const height = SEN0694.tipHeight(32)
+    const rate = SEN0694.tipRate()
+    const zone = SEN0694.drum()
+    const hit = SEN0694.wasStruck()
+    const speed = SEN0694.strikeSpeed()
+    SEN0694.onStrike(function () {
+        basic.pause(1)
+    })
     const ok = SEN0694.isConnected()
 
-    if (ok && ax + gy + mz + steps + tap + dir + facing + bearing + turned > -100000) {
+    if (ok && ax + gy + mz + steps + tap + dir + facing + bearing + turned + elev + height + rate + zone + speed > -100000 && !hit) {
         basic.pause(1)
     }
     SEN0694.reset()

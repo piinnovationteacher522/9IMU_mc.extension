@@ -16,4 +16,7 @@ declare namespace basic {
 
 declare namespace control {
     function millis(): number
+    function onEvent(src: number, value: number, handler: () => void): void
+    function raiseEvent(src: number, value: number): void
+    function inBackground(handler: () => void): void
 }

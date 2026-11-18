@@ -9,7 +9,7 @@
  */
 //% color="#E84E0F" weight=90 icon="\uf0b2"
 //% block="SEN0694 9軸"
-//% groups='["讀取", "設定", "運動偵測"]'
+//% groups='["讀取", "空氣鼓", "設定", "運動偵測"]'
 namespace SEN0694 {
     // I2C register map from DFRobot_Multi_DOF_IMU.h (REG_I2C_*).
     const REG_VID = 0x0000
@@ -33,6 +33,7 @@ namespace SEN0694 {
     const CACHE_MS = 30
 
     let deviceAddr = 0x4A
+    let i2cLock = false
     let connected = false
     let lastProbe = -100000
     let accelRangeG = 8
@@ -48,6 +49,24 @@ namespace SEN0694 {
     let rawMag: number[] = [0, 0, 0]
     let rawMagAt = -100000
     let headingReference = 0
+    let gravX = 0
+    let gravY = 0
+    let gravZ = 0
+    let gravReady = 0
+    let integratedAt = -1
+    let magUsedAt = -1
+    let stableHeadingValue = -1
+    let levelOffset = 0
+    let tipRateDps = 0
+    let strikeThreshold = 220
+    let strikeInStroke = 0
+    let strikePeak = 0
+    let strikeSpeedDps = 0
+    let strikeLatched = false
+    let strikeWatching = false
+    let magSkip = 0
+    const STRIKE_SRC = 55094
+    const STRIKE_EVT = 1
 
     export enum Quantity {
         //% block="加速度 (g)"
@@ -274,6 +293,122 @@ namespace SEN0694 {
         while (delta < -180) delta += 360
         return delta
     }
+
+    /**
+     * Tilt-compensated heading that ignores a knock.
+     * A sample is trusted only when trustAccel is non-zero and the vector
+     * length is near 1 g. Untrusted samples do not pull the gravity estimate;
+     * gyro (degrees/second) still rotates it, so a twist during the hit is kept.
+     * Returns [heading, gravityX, gravityY, gravityZ, ready].
+     */
+    function trackHeading(
+        ax: number, ay: number, az: number,
+        wx: number, wy: number, wz: number,
+        mx: number, my: number, mz: number,
+        dt: number,
+        sx: number, sy: number, sz: number,
+        ready: number,
+        trustAccel: number,
+        lastHeading: number
+    ): number[] {
+        const an = Math.sqrt(ax * ax + ay * ay + az * az)
+        const trusted = trustAccel != 0 && an > 0.65 && an < 1.45
+        if (!ready) {
+            if (!trusted) return [-1, sx, sy, sz, 0]
+            return [headingDegrees(ax, ay, az, mx, my, mz), ax, ay, az, 1]
+        }
+        if (dt < 0) dt = 0
+        if (dt > 0.1) {
+            if (trusted) {
+                sx = ax
+                sy = ay
+                sz = az
+            }
+            dt = 0
+        }
+        if (dt > 0) {
+            const scale = Math.PI / 180
+            const ox = wx * scale
+            const oy = wy * scale
+            const oz = wz * scale
+            const cx = oy * sz - oz * sy
+            const cy = oz * sx - ox * sz
+            const cz = ox * sy - oy * sx
+            sx -= cx * dt
+            sy -= cy * dt
+            sz -= cz * dt
+        }
+        if (trusted && dt > 0) {
+            const blend = 0.25
+            sx = sx * (1 - blend) + ax * blend
+            sy = sy * (1 - blend) + ay * blend
+            sz = sz * (1 - blend) + az * blend
+        }
+        const sn = Math.sqrt(sx * sx + sy * sy + sz * sz)
+        if (sn < 1e-6) return [-1, 0, 0, 0, 0]
+        sx /= sn
+        sy /= sn
+        sz /= sn
+        let deg = headingDegrees(sx, sy, sz, mx, my, mz)
+        if (deg < 0 && !trusted && lastHeading >= 0) deg = lastHeading
+        return [deg, sx, sy, sz, 1]
+    }
+
+    function clampUnit(value: number): number {
+        if (value > 1) return 1
+        if (value < -1) return -1
+        return value
+    }
+
+    /** Tip-up angle of +X, in degrees. ux, uy, uz is a unit up vector. */
+    function elevationDegrees(ux: number, uy: number, uz: number): number {
+        return Math.asin(clampUnit(ux)) * (180 / Math.PI)
+    }
+
+    /**
+     * How fast that tip-up angle is changing, in degrees/second.
+     * Positive means the tip is rising. Angular rates are degrees/second.
+     */
+    function elevationRateDps(ux: number, uy: number, uz: number, wy: number, wz: number): number {
+        const s = clampUnit(ux)
+        const cosE = Math.sqrt(Math.max(0, 1 - s * s))
+        const denom = cosE < 0.25 ? 0.25 : cosE
+        const scale = Math.PI / 180
+        const oy = wy * scale
+        const oz = wz * scale
+        const ds = -oy * uz + oz * uy
+        return (ds / denom) / scale
+    }
+
+    /** Tip height above the grip. Positive is above the hand, negative is below. */
+    function tipHeightCm(lengthCm: number, elevationDeg: number): number {
+        return lengthCm * Math.sin(elevationDeg * Math.PI / 180)
+    }
+
+    /**
+     * One air-drum stroke. downDps is how fast the tip is falling.
+     * The hit is reported when that fall slows back down, which is the bottom of the swing.
+     * Returns [fired, inStroke, peak, speed].
+     */
+    function nextStrike(downDps: number, threshold: number, inStroke: number, peak: number): number[] {
+        if (downDps < 0) downDps = 0
+        if (threshold < 1) threshold = 1
+        if (!inStroke) {
+            if (downDps >= threshold) return [0, 1, downDps, 0]
+            return [0, 0, 0, 0]
+        }
+        if (downDps > peak) peak = downDps
+        if (downDps < threshold * 0.5) return [1, 0, 0, peak]
+        return [0, 1, peak, 0]
+    }
+
+    /** Front-half zones: 0 unknown, 1 left, 2 center, 3 right. */
+    function drumZone(relative: number): number {
+        if (relative < -180 || relative > 180) return 0
+        if (relative < -25) return 1
+        if (relative > 25) return 3
+        return 2
+    }
     // SCALE_END
 
     function axisIndex(axis: Axis): number {
@@ -283,12 +418,15 @@ namespace SEN0694 {
     }
 
     function writeU16(reg: number, value: number): void {
+        while (i2cLock) basic.pause(1)
+        i2cLock = true
         const bytes = encodeWrite(reg, value)
         const buf = pins.createBuffer(4)
         for (let i = 0; i < 4; i++) {
             buf.setUint8(i, bytes[i])
         }
         pins.i2cWriteBuffer(deviceAddr, buf, false)
+        i2cLock = false
     }
 
     /**
@@ -296,12 +434,15 @@ namespace SEN0694 {
      * module firmware, then read. The 10 ms pause matches DFRobot's I2C driver.
      */
     function readBytes(reg: number, len: number): number[] {
+        while (i2cLock) basic.pause(1)
+        i2cLock = true
         const addr = pins.createBuffer(2)
         addr.setUint8(0, reg & 0xff)
         addr.setUint8(1, (reg >> 8) & 0xff)
         pins.i2cWriteBuffer(deviceAddr, addr, false)
         basic.pause(10)
         const data = pins.i2cReadBuffer(deviceAddr, len, false)
+        i2cLock = false
         const out: number[] = []
         if (!data || data.length < len) return out
         for (let i = 0; i < len; i++) {
@@ -409,10 +550,104 @@ namespace SEN0694 {
         return lsbToG(raw6[index], accelRangeG)
     }
 
+    function clearHeadingState(): void {
+        gravX = 0
+        gravY = 0
+        gravZ = 0
+        gravReady = 0
+        integratedAt = -1
+        magUsedAt = -1
+        stableHeadingValue = -1
+        tipRateDps = 0
+    }
+
+    function ensureDrumRanges(): void {
+        if (!userSetGyro && gyroRangeDps != 2000) {
+            userSetGyro = true
+            gyroCode = GyroRange.Dps2000
+            gyroRangeDps = 2000
+            if (connected) applyGyro(GyroRange.Dps2000)
+        }
+        if (!userSetAccel && accelRangeG < 8) {
+            userSetAccel = true
+            accelCode = AccelRange.G8
+            accelRangeG = 8
+            if (connected) applyAccel(AccelRange.G8)
+        }
+    }
+
+    function updateMotion(wantMag: boolean): void {
+        refresh6()
+        if (wantMag) refreshMag()
+        if (!connected) {
+            clearHeadingState()
+            return
+        }
+        const ax = lsbToG(raw6[0], accelRangeG)
+        const ay = lsbToG(raw6[1], accelRangeG)
+        const az = lsbToG(raw6[2], accelRangeG)
+        const mx = magToUt(rawMag[0])
+        const my = magToUt(rawMag[1])
+        const mz = magToUt(rawMag[2])
+        const wxRaw = lsbToDps(raw6[3], gyroRangeDps)
+        const wyRaw = lsbToDps(raw6[4], gyroRangeDps)
+        const wzRaw = lsbToDps(raw6[5], gyroRangeDps)
+        if (integratedAt == raw6At) {
+            if (wantMag && magUsedAt != rawMagAt && gravReady) {
+                const held = stableHeadingValue
+                stableHeadingValue = headingDegrees(gravX, gravY, gravZ, mx, my, mz)
+                if (stableHeadingValue < 0 && held >= 0) stableHeadingValue = held
+                magUsedAt = rawMagAt
+            }
+            return
+        }
+        let dt = 0.05
+        if (integratedAt >= 0) dt = (raw6At - integratedAt) / 1000
+        integratedAt = raw6At
+        magUsedAt = rawMagAt
+        let wx = wxRaw
+        let wy = wyRaw
+        let wz = wzRaw
+        const limit = gyroRangeDps * 0.95
+        if (Math.abs(wx) >= limit || Math.abs(wy) >= limit || Math.abs(wz) >= limit) {
+            wx = 0
+            wy = 0
+            wz = 0
+        }
+        const clipped = Math.abs(raw6[0]) > 32000 || Math.abs(raw6[1]) > 32000 || Math.abs(raw6[2]) > 32000
+        const tracked = trackHeading(
+            ax, ay, az, wx, wy, wz, mx, my, mz, dt,
+            gravX, gravY, gravZ, gravReady, clipped ? 0 : 1, stableHeadingValue
+        )
+        stableHeadingValue = tracked[0]
+        gravX = tracked[1]
+        gravY = tracked[2]
+        gravZ = tracked[3]
+        gravReady = tracked[4]
+        if (!gravReady) {
+            tipRateDps = 0
+            return
+        }
+        tipRateDps = elevationRateDps(gravX, gravY, gravZ, wyRaw, wzRaw)
+        const elev = elevationDegrees(gravX, gravY, gravZ)
+        if (elev <= -75 || elev >= 75) return
+        const down = tipRateDps < 0 ? -tipRateDps : 0
+        const step = nextStrike(down, strikeThreshold, strikeInStroke, strikePeak)
+        strikeInStroke = step[1]
+        strikePeak = step[2]
+        if (step[0]) {
+            strikeSpeedDps = step[3]
+            strikeLatched = true
+            if (strikeWatching) control.raiseEvent(STRIKE_SRC, STRIKE_EVT)
+        }
+    }
+
     /**
      * 模組 +X 軸目前的磁方位角，0 到 360 度。
      * 0 表示 +X 指向磁北，90 表示指向磁東，順時針增加。
      * 從正上方往下看。平放或傾斜都可以；+X 幾乎朝天或朝地時回傳 -1。
+     * 敲擊時加速度會突然偏離 1 g，這一筆不用來判斷傾斜，方向仍連續。
+     * 敲擊同時轉動時，用陀螺儀把傾斜方向補上。
      * 這是磁北，不是地圖上的真北。附近的鐵或磁鐵會使角度偏移。
      */
     //% blockId=sen0694_heading
@@ -420,17 +655,8 @@ namespace SEN0694 {
     //% group="讀取"
     //% weight=96
     export function heading(): number {
-        refresh6()
-        refreshMag()
-        if (!connected) return -1
-        return headingDegrees(
-            lsbToG(raw6[0], accelRangeG),
-            lsbToG(raw6[1], accelRangeG),
-            lsbToG(raw6[2], accelRangeG),
-            magToUt(rawMag[0]),
-            magToUt(rawMag[1]),
-            magToUt(rawMag[2])
-        )
+        updateMotion(true)
+        return stableHeadingValue
     }
 
     /**
@@ -461,6 +687,171 @@ namespace SEN0694 {
         return relativeDegrees(heading(), headingReference)
     }
 
+    export enum Drum {
+        //% block="未知"
+        Unknown = 0,
+        //% block="左"
+        Left = 1,
+        //% block="中"
+        Center = 2,
+        //% block="右"
+        Right = 3
+    }
+
+    /**
+     * 鼓棍 +X 軸抬離水平面的角度。
+     * 棍頭朝上為正，最大 90；朝下為負，最小 -90；水平為 0。
+     * 把模組 +X 指向棍頭。抬高棍頭時這個角度應變大。
+     */
+    //% blockId=sen0694_elevation
+    //% block="鼓棍仰角"
+    //% group="空氣鼓"
+    //% weight=80
+    export function stickElevation(): number {
+        ensureDrumRanges()
+        updateMotion(false)
+        if (!gravReady) return 0
+        let deg = elevationDegrees(gravX, gravY, gravZ) - levelOffset
+        while (deg > 180) deg -= 360
+        while (deg < -180) deg += 360
+        return deg
+    }
+
+    /**
+     * 棍頭相對手握處的高度，單位公分。
+     * 水平為 0，高過手腕為正，低過手腕為負。
+     * 這是手腕當支點、棍長固定時的高度，不是離地面的高度。
+     */
+    //% blockId=sen0694_tip_height
+    //% block="棍頭高度 (cm) 棍長 %length"
+    //% length.defl=32
+    //% length.min=5
+    //% length.max=80
+    //% group="空氣鼓"
+    //% weight=70
+    //% inlineInputMode=inline
+    export function tipHeight(length: number): number {
+        return tipHeightCm(length, stickElevation())
+    }
+
+    /**
+     * 棍頭上下揮的角速度，單位 °/s。
+     * 正數是向上，負數是向下打。
+     */
+    //% blockId=sen0694_tip_rate
+    //% block="棍頭角速度"
+    //% group="空氣鼓"
+    //% weight=85
+    export function tipRate(): number {
+        ensureDrumRanges()
+        updateMotion(false)
+        return tipRateDps
+    }
+
+    /**
+     * 以相對角度分成左、中、右三面鼓。
+     * 先把鼓棍指向中間那面鼓，再執行「將目前方向設為 0 度」。
+     * 偏左超過 25 度是左，偏右超過 25 度是右。讀不到方向時是未知。
+     */
+    //% blockId=sen0694_drum
+    //% block="鼓位"
+    //% group="空氣鼓"
+    //% weight=60
+    export function drum(): Drum {
+        ensureDrumRanges()
+        const bearing = heading()
+        if (bearing < 0) return Drum.Unknown
+        const zone = drumZone(relativeDegrees(bearing, headingReference))
+        if (zone == 1) return Drum.Left
+        if (zone == 3) return Drum.Right
+        if (zone == 2) return Drum.Center
+        return Drum.Unknown
+    }
+
+    /**
+     * 一次向下揮棍，並在揮勢慢下來時成立，約是落到鼓面的時刻。
+     * 每次打擊只會成立一次，讀走之後變回假，直到下一擊。
+     */
+    //% blockId=sen0694_was_struck
+    //% block="發生打擊"
+    //% group="空氣鼓"
+    //% weight=95
+    export function wasStruck(): boolean {
+        ensureDrumRanges()
+        updateMotion(false)
+        if (!strikeLatched) return false
+        strikeLatched = false
+        return true
+    }
+
+    /**
+     * 最近一次打擊裡，棍頭向下的最快角速度，單位 °/s。
+     * 可用來決定音量。還沒打過是 0。
+     */
+    //% blockId=sen0694_strike_speed
+    //% block="這次打擊速度 (°/s)"
+    //% group="空氣鼓"
+    //% weight=90
+    export function strikeSpeed(): number {
+        ensureDrumRanges()
+        updateMotion(false)
+        return strikeSpeedDps
+    }
+
+    /**
+     * 向下揮棍並在最低點附近執行。
+     * 裡面用「鼓位」選鼓，「這次打擊速度」調音量，「棍頭高度」忽略揮在鼓面上方的空揮。
+     */
+    //% blockId=sen0694_on_strike
+    //% block="當鼓棍打擊時"
+    //% group="空氣鼓"
+    //% weight=100
+    export function onStrike(handler: () => void): void {
+        control.onEvent(STRIKE_SRC, STRIKE_EVT, handler)
+        if (strikeWatching) return
+        strikeWatching = true
+        control.inBackground(function () {
+            while (true) {
+                ensureDrumRanges()
+                magSkip++
+                updateMotion(magSkip >= 4)
+                if (magSkip >= 4) magSkip = 0
+                basic.pause(15)
+            }
+        })
+    }
+
+    /**
+     * 把此刻的鼓棍仰角記成水平。
+     * 模組若沒有完全貼平鼓棍，先把鼓棍拿成你要的水平，再執行這塊。
+     */
+    //% blockId=sen0694_set_level
+    //% block="將目前姿勢設為水平"
+    //% group="空氣鼓"
+    //% weight=50
+    export function setStickLevel(): void {
+        ensureDrumRanges()
+        levelOffset = 0
+        levelOffset = stickElevation()
+    }
+
+    /**
+     * 棍頭向下的角速度超過這個值，才開始算一次打擊。
+     * 預設 220 °/s。輕敲抓不到就調低，走路也會觸發就調高。
+     */
+    //% blockId=sen0694_strike_threshold
+    //% block="設定打擊門檻為 %speed °/s"
+    //% speed.defl=220
+    //% speed.min=40
+    //% speed.max=1800
+    //% group="空氣鼓"
+    //% weight=40
+    //% inlineInputMode=inline
+    export function setStrikeThreshold(speed: number): void {
+        if (speed < 1) speed = 1
+        strikeThreshold = speed
+    }
+
     /**
      * 以指定的 I2C 地址啟動感測器。
      * 未呼叫時，第一次讀取會用 0x4A 自動啟動。
@@ -477,6 +868,11 @@ namespace SEN0694 {
         connected = false
         raw6At = -100000
         rawMagAt = -100000
+        clearHeadingState()
+        levelOffset = 0
+        strikeInStroke = 0
+        strikePeak = 0
+        strikeLatched = false
         lastProbe = control.millis()
         probeAndConfigure()
     }
@@ -575,6 +971,12 @@ namespace SEN0694 {
         gyroRangeDps = 2000
         raw6At = -100000
         rawMagAt = -100000
+        clearHeadingState()
+        levelOffset = 0
+        strikeInStroke = 0
+        strikePeak = 0
+        strikeLatched = false
+        strikeThreshold = 220
     }
 
     /**
